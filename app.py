@@ -327,6 +327,9 @@ def download_last():
         mimetype="application/pdf"
     )
 
+@app.route("/ping")
+def ping():
+    return "pong"
 
 # -------------------------------------------------------------
 # RUN
