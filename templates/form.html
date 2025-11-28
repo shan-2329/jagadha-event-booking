@@ -34,6 +34,11 @@
         color:white;             /* keep text white */
     }
 
+body {
+    background: url("/static/images/bg.jpg") no-repeat center center fixed;
+    background-size: cover;
+}
+
 </style>
 </head>
 <body>
@@ -117,9 +122,26 @@
 
             <hr>
 
+            <!-- Reset + Download Buttons -->
+            <div class="d-flex justify-content-between mb-3">
+
+                <!-- Reset Form -->
+                <a href="{{ url_for('form_page') }}" class="btn btn-secondary">
+                    Reset Form
+                </a>
+
+                <!-- Download Last PDF -->
+                <a href="/download_last" class="btn btn-success">
+                    Download Last PDF
+                </a>
+
+            </div>
+
+            <!-- Generate Button -->
             <div class="d-grid">
                 <button class="btn pink-btn btn-lg">Generate PDF</button>
             </div>
+
 
         </form>
     </div>
@@ -150,6 +172,30 @@ function updateAllTotal() {
     let all = stage + stall + other;
     document.getElementById('all_total').value = all.toFixed(2);
 }
+</script>
+
+<!-- Toast Notification -->
+<div class="position-fixed top-0 end-0 p-3" style="z-index: 9999;">
+    <div id="pdfToast" class="toast align-items-center text-white"
+         style="background:#E91E63;" role="alert" aria-live="assertive" aria-atomic="true">
+        <div class="d-flex">
+            <div class="toast-body">
+                PDF Generated Successfully! 💗
+            </div>
+            <button type="button" class="btn-close btn-close-white me-2 m-auto"
+                    data-bs-dismiss="toast" aria-label="Close"></button>
+        </div>
+    </div>
+</div>
+
+<script>
+document.addEventListener("DOMContentLoaded", function() {
+    {% if success %}
+        var toastElement = document.getElementById('pdfToast');
+        var toast = new bootstrap.Toast(toastElement);
+        toast.show();
+    {% endif %}
+});
 </script>
 
 </body>
