@@ -320,7 +320,7 @@ def generate_pdf():
     session["last_pdf"] = pdf_buffer.getvalue()
     session["pdf_success"] = True
 
-    filename = f"{customer.replace(' ', '_')}_Event_Quotation_  {event_date.replace (' ', '_')}.pdf"
+    filename = f"{customer.replace(' ', '_')}_Event_Quotation_{event_date.replace (' ', '_')}.pdf"
     return send_file(pdf_buffer, as_attachment=True, download_name=filename)
 
 
