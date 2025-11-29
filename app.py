@@ -7,6 +7,7 @@ from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.units import mm
 from reportlab.lib import colors
+from reportlab.platypus import Image
 
 app = Flask(__name__)
 app.secret_key = "987654321"
@@ -185,7 +186,7 @@ def create_quotation_pdf(customer, event_date, mandabam,
 
     doc = SimpleDocTemplate(buffer, pagesize=A4,
                             leftMargin=20 * mm, rightMargin=20 * mm,
-                            topMargin=25 * mm, bottomMargin=20 * mm)
+                            topMargin=15 * mm, bottomMargin=15 * mm)
 
     story = []
 
@@ -193,10 +194,20 @@ def create_quotation_pdf(customer, event_date, mandabam,
     # story.append(HeaderBar(PAGE_WIDTH - 40 * mm))
     # story.append(Spacer(1, 8))
 
-    story.append(Paragraph(
-        "<para align='center'><b>JAGADHA 💗 A to Z 💗 Event Management</b></para>",
-        styles["TitleCentered"]
-    ))
+    # ------------------ LOGO ADD HERE -------------------
+    logo_path = "static/images/logo.jpg"
+    try:
+        logo = Image(logo_path, width=90 * mm, height=50 * mm)
+        logo.hAlign = "CENTER"
+        story.append(logo)
+        story.append(Spacer(1, 8))
+    except:
+        pass
+
+    # story.append(Paragraph(
+    #     "<para align='center'><b>JAGADHA 💗 A to Z 💗 Event Management</b></para>",
+    #     styles["TitleCentered"]
+    # ))
     story.append(Spacer(1, 10))
     story.append(Paragraph("<para align='center'><b><u>QUOTATION</u></b></para>", styles["Heading2"]))
     story.append(Spacer(1, 14))
@@ -305,10 +316,11 @@ def generate_pdf():
         other_rows, other_total_manual
     )
 
+
     session["last_pdf"] = pdf_buffer.getvalue()
     session["pdf_success"] = True
 
-    filename = f"{customer.replace(' ', '_')}_Quotation.pdf"
+    filename = f"{customer.replace(' ', '_')}_Event_Quotation_  {event_date.replace (' ', '_')}.pdf"
     return send_file(pdf_buffer, as_attachment=True, download_name=filename)
 
 
