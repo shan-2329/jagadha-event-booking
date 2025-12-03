@@ -1,13 +1,12 @@
 from flask import Flask, render_template, request, send_file, redirect, url_for, session, flash
 import io
 from reportlab.platypus import (
-    SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, Flowable
+    SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, Flowable, Image
 )
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.pagesizes import A4
 from reportlab.lib.units import mm
 from reportlab.lib import colors
-from reportlab.platypus import Image
 
 app = Flask(__name__)
 app.secret_key = "987654321"
@@ -17,7 +16,6 @@ app.secret_key = "987654321"
 # -------------------------------------------------------------
 USERNAME = "admin"
 PASSWORD = "Jagadha@123"
-
 
 # -------------------------------------------------------------
 # LOGIN PAGE
@@ -34,6 +32,7 @@ def login():
         else:
             flash("Invalid username or password!", "danger")
             return redirect(url_for("login"))
+
     return render_template("login.html")
 
 
@@ -48,7 +47,9 @@ def logout():
 # -------------------------------------------------------------
 @app.before_request
 def require_login():
-    if request.endpoint in ["static", "login"]:
+    allowed = ["static", "login", "logout", "ping"]
+
+    if request.endpoint in allowed:
         return
 
     protected = ["form_page", "generate_pdf", "download_last"]
@@ -67,7 +68,6 @@ LIGHT_PINK = colors.HexColor("#F8D7E8")
 SOFT_PINK = colors.HexColor("#FFF1F6")
 GREY_BG = colors.HexColor("#F2F2F2")
 DARK_TEXT = colors.HexColor("#333333")
-
 
 # -------------------------------------------------------------
 # UTIL
@@ -154,7 +154,6 @@ def build_section_table(title, rows, styles, total_manual=None):
         ("ALIGN", (1, 1), (1, -1), "RIGHT"),
     ])
 
-    # Highlight total row
     if total_manual is not None:
         last = len(table_data) - 1
         style.add("BACKGROUND", (0, last), (-1, last), GREY_BG)
@@ -162,6 +161,7 @@ def build_section_table(title, rows, styles, total_manual=None):
     tbl.setStyle(style)
     story.append(tbl)
     story.append(Spacer(1, 12))
+
     return story
 
 
@@ -190,11 +190,7 @@ def create_quotation_pdf(customer, event_date, mandabam,
 
     story = []
 
-    # Header title bar
-    # story.append(HeaderBar(PAGE_WIDTH - 40 * mm))
-    # story.append(Spacer(1, 8))
-
-    # ------------------ LOGO ADD HERE -------------------
+    # ------------------ LOGO -------------------
     logo_path = "static/images/logo.jpg"
     try:
         logo = Image(logo_path, width=90 * mm, height=50 * mm)
@@ -204,15 +200,11 @@ def create_quotation_pdf(customer, event_date, mandabam,
     except:
         pass
 
-    # story.append(Paragraph(
-    #     "<para align='center'><b>JAGADHA 💗 A to Z 💗 Event Management</b></para>",
-    #     styles["TitleCentered"]
-    # ))
     story.append(Spacer(1, 10))
     story.append(Paragraph("<para align='center'><b><u>QUOTATION</u></b></para>", styles["Heading2"]))
     story.append(Spacer(1, 14))
 
-    # Customer Details Box
+    # Customer details
     cust = Table([
         [
             Paragraph(f"<b>Customer Name:</b> {customer}", styles["Normal"]),
@@ -238,12 +230,10 @@ def create_quotation_pdf(customer, event_date, mandabam,
     story.extend(build_section_table("STALL ITEMS", stall_rows, styles, stall_total_manual))
     story.extend(build_section_table("OTHER ITEMS", other_rows, styles, other_total_manual))
 
-    # Summary Table
-    # AMOUNT SUMMARY Header
+    # Summary
     story.append(Paragraph("<b>AMOUNT SUMMARY</b>", styles["SectionHeading"]))
     story.append(Spacer(1, 6))
 
-    # Summary Table
     summary = Table([
         ["ALL TOTAL", Paragraph(f"<b>{stall_all_total:.2f}</b>", styles["Right"])],
         ["ADVANCE", Paragraph(f"<b>{stall_advance:.2f}</b>", styles["Right"])],
@@ -260,12 +250,8 @@ def create_quotation_pdf(customer, event_date, mandabam,
     story.append(summary)
     story.append(Spacer(1, 20))
 
-    story.append(Paragraph(
-        "<para align='center'><b>*** THANK YOU ***</b></para>",
-        styles["Heading2"]
-    ))
+    story.append(Paragraph("<para align='center'><b>*** THANK YOU ***</b></para>", styles["Heading2"]))
 
-    # Build PDF with border
     doc.build(story, onFirstPage=draw_border, onLaterPages=draw_border)
 
     buffer.seek(0)
@@ -316,11 +302,10 @@ def generate_pdf():
         other_rows, other_total_manual
     )
 
-
     session["last_pdf"] = pdf_buffer.getvalue()
     session["pdf_success"] = True
 
-    filename = f"{customer.replace(' ', '_')}_Event_Quotation_{event_date.replace (' ', '_')}.pdf"
+    filename = f"{customer.replace(' ', '_')}_Event_Quotation_{event_date.replace(' ', '_')}.pdf"
     return send_file(pdf_buffer, as_attachment=True, download_name=filename)
 
 
@@ -339,9 +324,11 @@ def download_last():
         mimetype="application/pdf"
     )
 
+
 @app.route("/ping")
 def ping():
     return "pong"
+
 
 # -------------------------------------------------------------
 # RUN
