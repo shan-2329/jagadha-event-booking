@@ -1,5 +1,7 @@
 from flask import Flask, render_template, request, send_file, redirect, url_for, session, flash
 import io
+import os
+import time
 from reportlab.platypus import (
     SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, Flowable, Image
 )
@@ -10,6 +12,11 @@ from reportlab.lib import colors
 
 app = Flask(__name__)
 app.secret_key = "987654321"
+
+# TEMP FOLDER TO STORE PDFs
+TEMP_DIR = "temp_pdfs"
+if not os.path.exists(TEMP_DIR):
+    os.makedirs(TEMP_DIR)
 
 # -------------------------------------------------------------
 # LOGIN CREDENTIALS
@@ -85,13 +92,11 @@ def safe_float(val):
 def draw_border(canvas, doc):
     canvas.saveState()
 
-    # Outer dark pink
     canvas.setLineWidth(3)
     canvas.setStrokeColor(PINK_DARK)
     canvas.rect(12 * mm, 12 * mm,
                 PAGE_WIDTH - 24 * mm, PAGE_HEIGHT - 24 * mm)
 
-    # Inner soft border
     canvas.setLineWidth(1)
     canvas.setStrokeColor(LIGHT_PINK)
     canvas.rect(16 * mm, 16 * mm,
@@ -190,7 +195,6 @@ def create_quotation_pdf(customer, event_date, mandabam,
 
     story = []
 
-    # ------------------ LOGO -------------------
     logo_path = "static/images/logo.jpg"
     try:
         logo = Image(logo_path, width=90 * mm, height=50 * mm)
@@ -204,7 +208,6 @@ def create_quotation_pdf(customer, event_date, mandabam,
     story.append(Paragraph("<para align='center'><b><u>QUOTATION</u></b></para>", styles["Heading2"]))
     story.append(Spacer(1, 14))
 
-    # Customer details
     cust = Table([
         [
             Paragraph(f"<b>Customer Name:</b> {customer}", styles["Normal"]),
@@ -225,12 +228,10 @@ def create_quotation_pdf(customer, event_date, mandabam,
     story.append(cust)
     story.append(Spacer(1, 14))
 
-    # Sections
     story.extend(build_section_table("STAGE DECORATION", stage_rows, styles, stage_total_manual))
     story.extend(build_section_table("STALL ITEMS", stall_rows, styles, stall_total_manual))
     story.extend(build_section_table("OTHER ITEMS", other_rows, styles, other_total_manual))
 
-    # Summary
     story.append(Paragraph("<b>AMOUNT SUMMARY</b>", styles["SectionHeading"]))
     story.append(Spacer(1, 6))
 
@@ -268,7 +269,7 @@ def form_page():
 
 
 # -------------------------------------------------------------
-# GENERATE PDF
+# GENERATE PDF  (FIXED)
 # -------------------------------------------------------------
 @app.route("/generate_pdf", methods=["POST"])
 def generate_pdf():
@@ -302,27 +303,34 @@ def generate_pdf():
         other_rows, other_total_manual
     )
 
-    session["last_pdf"] = pdf_buffer.getvalue()
+    # ----- FIXED: SAVE PDF TO TEMP FILE (NOT SESSION) -----
+    filename = f"{int(time.time())}.pdf"
+    file_path = os.path.join(TEMP_DIR, filename)
+
+    with open(file_path, "wb") as f:
+        f.write(pdf_buffer.getvalue())
+
+    session["last_pdf_path"] = file_path
     session["pdf_success"] = True
 
-    filename = f"{customer.replace(' ', '_')}_Event_Quotation_{event_date.replace(' ', '_')}.pdf"
-    return send_file(pdf_buffer, as_attachment=True, download_name=filename)
+    download_name = f"{customer.replace(' ', '_')}_Event_Quotation_{event_date.replace(' ', '_')}.pdf"
+    return send_file(pdf_buffer, as_attachment=True, download_name=download_name)
 
 
 # -------------------------------------------------------------
-# DOWNLOAD LAST PDF
+# DOWNLOAD LAST PDF (FIXED)
 # -------------------------------------------------------------
 @app.route("/download_last")
 def download_last():
-    if not session.get("last_pdf"):
-        return "No PDF generated yet."
+    file_path = session.get("last_pdf_path")
 
-    return send_file(
-        io.BytesIO(session["last_pdf"]),
-        as_attachment=True,
-        download_name="Last_Generated_Quotation.pdf",
-        mimetype="application/pdf"
-    )
+    if not file_path or not os.path.exists(file_path):
+        return "No PDF available."
+
+    return send_file(file_path,
+                     as_attachment=True,
+                     download_name="Last_Generated_Quotation.pdf",
+                     mimetype="application/pdf")
 
 
 @app.route("/ping")
