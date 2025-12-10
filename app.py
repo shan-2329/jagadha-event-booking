@@ -1,345 +1,614 @@
-from flask import Flask, render_template, request, send_file, redirect, url_for, session, flash
-import io
+# app.py
+from flask import Flask, render_template, request, redirect, url_for, flash, g, session, jsonify, Response, send_file
+import sqlite3
+from pathlib import Path
 import os
-import time
-from reportlab.platypus import (
-    SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, Flowable, Image
-)
-from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
+import threading
+import requests
+import csv
+import io
+import base64
+from datetime import datetime, date, timedelta
+from io import BytesIO
+
+# Email (Brevo)
+from sib_api_v3_sdk import Configuration, TransactionalEmailsApi, ApiClient, SendSmtpEmail
+
+# PDF generation
 from reportlab.lib.pagesizes import A4
-from reportlab.lib.units import mm
-from reportlab.lib import colors
+from reportlab.pdfgen import canvas
 
-app = Flask(__name__)
-app.secret_key = "987654321"
+# scheduler for daily report
+from apscheduler.schedulers.background import BackgroundScheduler
 
-# TEMP FOLDER TO STORE PDFs
-TEMP_DIR = "temp_pdfs"
-if not os.path.exists(TEMP_DIR):
-    os.makedirs(TEMP_DIR)
+# ---------------- App + DB ----------------
+BASE = Path(__file__).resolve().parent
+DB_PATH = BASE / "instance" / "bookings.db"
+DB_PATH.parent.mkdir(parents=True, exist_ok=True)
 
-# -------------------------------------------------------------
-# LOGIN CREDENTIALS
-# -------------------------------------------------------------
-USERNAME = "admin"
-PASSWORD = "Jagadha@123"
+app = Flask(__name__, template_folder=str(BASE / "templates"), static_folder=str(BASE / "static"))
+app.secret_key = os.getenv("SECRET_KEY", "change_this_secret_key")
+app.config["DATABASE"] = str(DB_PATH)
 
-# -------------------------------------------------------------
-# LOGIN PAGE
-# -------------------------------------------------------------
+# Optional: provide SITE_URL env var (e.g. https://your-domain.com) to build absolute links in emails
+SITE_URL = os.getenv("SITE_URL")
+
+ADMIN_USER = os.getenv("ADMIN_USER", "admin")
+ADMIN_PASS = os.getenv("ADMIN_PASS", "admin123")
+
+# ---------------- Database Helpers ----------------
+def get_db():
+    if "db" not in g:
+        g.db = sqlite3.connect(app.config["DATABASE"], detect_types=sqlite3.PARSE_DECLTYPES)
+        g.db.row_factory = sqlite3.Row
+    return g.db
+
+@app.teardown_appcontext
+def close_db(exception=None):
+    db = g.pop("db", None)
+    if db:
+        db.close()
+
+def create_tables():
+    db = get_db()
+    db.execute(
+        """
+        CREATE TABLE IF NOT EXISTS bookings (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            name TEXT NOT NULL,
+            location TEXT NOT NULL,
+            customer_email TEXT,
+            phone TEXT NOT NULL,
+            event_date TEXT NOT NULL,
+            service TEXT,
+            extras TEXT,
+            notes TEXT,
+            status TEXT DEFAULT 'Pending',
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+        """
+    )
+    db.commit()
+
+with app.app_context():
+    create_tables()
+
+# ---------------- Utilities: PDF receipt ----------------
+def generate_pdf_receipt(booking_row):
+    """
+    Return bytes of a simple PDF receipt using reportlab
+    """
+    buffer = BytesIO()
+    p = canvas.Canvas(buffer, pagesize=A4)
+    width, height = A4
+    x = 40
+    y = height - 60
+
+    p.setFont("Helvetica-Bold", 18)
+    p.drawString(x, y, "JAGADHA A to Z Event Management")
+    y -= 30
+    p.setFont("Helvetica", 12)
+    p.drawString(x, y, f"Booking ID: {booking_row['id']}")
+    y -= 18
+    p.drawString(x, y, f"Name: {booking_row['name']}")
+    y -= 16
+    p.drawString(x, y, f"Phone: {booking_row['phone']}")
+    y -= 16
+    p.drawString(x, y, f"Email: {booking_row['customer_email'] or '-'}")
+    y -= 16
+    p.drawString(x, y, f"Event Date: {booking_row['event_date']}")
+    y -= 16
+    p.drawString(x, y, f"Service: {booking_row['service']}")
+    y -= 16
+    p.drawString(x, y, "Extras:")
+    y -= 14
+    p.setFont("Helvetica", 10)
+    p.drawString(x+12, y, booking_row['extras'] or "-")
+    y -= 20
+    p.setFont("Helvetica", 12)
+    p.drawString(x, y, "Notes:")
+    y -= 14
+    p.setFont("Helvetica", 10)
+    text = p.beginText(x, y)
+    notes = booking_row['notes'] or ""
+    for line in notes.splitlines():
+        text.textLine(line)
+    p.drawText(text)
+    p.showPage()
+    p.save()
+    buffer.seek(0)
+    return buffer.read()
+
+# ---------------- SMS (Fast2SMS) ----------------
+def send_sms_fast2sms(phone, message):
+    api_key = os.getenv("FAST2SMS_API_KEY")
+    if not api_key:
+        app.logger.info("SMS Disabled — FAST2SMS_API_KEY missing.")
+        return
+    url = "https://www.fast2sms.com/dev/bulkV2"
+    payload = {
+        "sender_id": "TXTIND",
+        "message": message,
+        "language": "english",
+        "route": "v3",
+        "numbers": phone
+    }
+    headers = {"authorization": api_key}
+    try:
+        res = requests.post(url, data=payload, headers=headers, timeout=15)
+        app.logger.info("SMS SENT ✓ %s", res.text)
+    except Exception as e:
+        app.logger.exception("SMS ERROR: %s", e)
+
+# ---------------- EMAIL (BREVO API) with PDF attachment & Tamil ----------------
+def send_email_via_brevo(
+        name, location, phone, event_date, service,
+        extras, notes, customer_email=None,
+        status="Pending", booking_id=None
+    ):
+    """
+    Send booking email using BREVO to both ADMIN and Customer (if available).
+    Includes Tamil translation + PDF receipt (when booking_id is provided).
+    Safe URL building: uses SITE_URL env if provided; otherwise tries url_for inside app context; falls back to localhost.
+    """
+    # website link resolution (safe outside request)
+    website_link = SITE_URL
+    if not website_link:
+        try:
+            with app.app_context():
+                # url_for will require SERVER_NAME if no request; wrap in try/except
+                from flask import url_for as _url_for
+                website_link = _url_for('index', _external=True)
+        except Exception:
+            website_link = os.getenv("SITE_URL", "http://localhost:5000")
+
+    api_key = os.getenv("BREVO_API_KEY")
+    admin_email = os.getenv("ADMIN_EMAIL")
+
+    if not api_key or not admin_email:
+        app.logger.info("Brevo Missing API or Admin email.")
+        return
+
+    configuration = Configuration()
+    configuration.api_key["api-key"] = api_key
+    api_instance = TransactionalEmailsApi(ApiClient(configuration))
+
+    # Send to admin + customer
+    to_list = [{"email": admin_email}]
+    if customer_email and customer_email.strip():
+        to_list.append({"email": customer_email.strip()})
+
+    # Status text
+    status_text = {
+        "Pending": "🎉 Booking Received",
+        "Confirmed": "✅ Booking Confirmed",
+        "Rejected": "❌ Booking Rejected"
+    }.get(status, "🎉 Booking Update")
+
+    # Tamil translation
+    tamil_status = {
+        "Pending": "உங்கள் முன்பதிவு பெறப்பட்டது",
+        "Confirmed": "உங்கள் முன்பதிவு உறுதிசெய்யப்பட்டது",
+        "Rejected": "மன்னிக்கவும் — உங்கள் முன்பதிவு நிராகரிக்கப்பட்டது"
+    }.get(status, "நிலையை புதுப்பித்தல்")
+
+    # EMAIL HTML TEMPLATE
+    html_content = f"""
+    <!DOCTYPE html><html><body style="font-family: Arial, sans-serif; background:#f7f7f7; margin:0; padding:0;">
+    <div style="max-width:600px; margin:18px auto; background:#fff; border-radius:10px; overflow:hidden; box-shadow:0 4px 20px rgba(0,0,0,0.08);">
+      <div style="background:#f9c5d5; padding:18px; text-align:center;">
+        <h2 style="margin:0; color:#b01357;">❤️ JAGADHA A to Z Event Management ❤️</h2>
+      </div>
+      <div style="padding:18px; color:#333;">
+        <h3>{status_text}</h3>
+        <p>Dear <b>{name}</b>,</p>
+        <p>Your booking details:</p>
+        <table style="width:100%; font-size:14px;">
+          <tr><td><b>📛 Name:</b></td><td>{name}</td></tr>
+          <tr><td><b>📞 Phone:</b></td><td>{phone}</td></tr>
+          <tr><td><b>📧 Email:</b></td><td>{customer_email}</td></tr>
+          <tr><td><b>📅 Event Date:</b></td><td>{event_date}</td></tr>
+          <tr><td><b>🎈 Service:</b></td><td>{service}</td></tr>
+          <tr><td><b>✨ Extras:</b></td><td>{extras}</td></tr>
+          <tr><td><b>📍 Location:</b></td><td>{location}</td></tr>
+        </table>
+
+        <p style="margin-top:12px;"><b>Notes:</b> {notes or '-'}</p>
+
+        <hr>
+        <p><b>தமிழில்: </b>{tamil_status}</p>
+        <p style="font-size:13px; color:#666;">(மேலும் உதவிக்கு எங்களைத் தொடர்பு கொள்ளவும். Mob: 96597 96217)</p>
+
+        <div style="text-align:center; margin:16px 0;">
+          <a href="{website_link}" style="background:#b01357; color:white; padding:10px 18px; text-decoration:none; border-radius:6px;">Visit Our Website</a>
+        </div>
+      </div>
+      <div style="background:#fafafa; padding:12px; text-align:center; font-size:12px;">
+        © 2025 JAGADHA A to Z Event Management — Automated message
+      </div>
+    </div>
+    </body></html>
+    """
+
+    # PDF ATTACHMENT HANDLING
+    attachments = None
+    if booking_id:
+        try:
+            db = get_db()
+            row = db.execute("SELECT * FROM bookings WHERE id=?", (booking_id,)).fetchone()
+            if row:
+                pdf_bytes = generate_pdf_receipt(row)
+                b64 = base64.b64encode(pdf_bytes).decode("utf-8")
+                attachments = [{
+                    "content": b64,
+                    "name": f"booking_{booking_id}.pdf"
+                }]
+        except Exception as e:
+            app.logger.exception("PDF generation failed: %s", e)
+
+    # SEND EMAIL
+    send_smtp_email = SendSmtpEmail(
+        to=to_list,
+        sender={"email": admin_email},
+        subject=f"{status_text} - {name}",
+        html_content=html_content,
+        attachment=attachments
+    )
+
+    try:
+        api_instance.send_transac_email(send_smtp_email)
+        app.logger.info("BREVO EMAIL SENT ✓ to Admin + Customer")
+    except Exception as e:
+        app.logger.exception("BREVO ERROR: %s", e)
+
+# ---------------- WHATSAPP (UltraMSG) with Template fallback ----------------
+def send_whatsapp_message(name, phone, event_date, service,
+                          extras, location, customer_email, notes):
+    instance = os.getenv("W_INSTANCE")
+    token = os.getenv("W_TOKEN")
+    # Full template message (professional)
+    message_template = (
+        f"🌸 JAGADHA A to Z Event Management 🌸\n\n"
+        f"Booking Update\n"
+        f"Name: {name}\n"
+        f"Phone: {phone}\n"
+        f"Date: {event_date}\n"
+        f"Service: {service}\n"
+        f"Location: {location}\n\n"
+        f"Thank you!"
+    )
+
+    # If UltraMSG configured, try API
+    if instance and token:
+        url = f"https://api.ultramsg.com/{instance}/messages/chat"
+        payload = {"token": token, "to": f"91{phone}", "body": message_template}
+        try:
+            r = requests.post(url, data=payload, timeout=15)
+            app.logger.info("WHATSAPP SENT ✓ %s", r.text)
+            return
+        except Exception as e:
+            app.logger.exception("WHATSAPP API Error, falling back to wa.me: %s", e)
+
+    # Fallback: log and rely on wa.me links in emails or manual copy
+    app.logger.info("WHATSAPP API disabled or failed → fallback to wa.me link")
+
+# ---------------- TELEGRAM ADMIN PUSH (for new bookings & daily report) ----------------
+def telegram_push(message):
+    token = os.getenv("TELEGRAM_BOT_TOKEN")
+    chat_id = os.getenv("TELEGRAM_CHAT_ID")
+    if not token or not chat_id:
+        app.logger.info("Telegram disabled — missing TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID")
+        return
+    try:
+        url = f"https://api.telegram.org/bot{token}/sendMessage"
+        payload = {"chat_id": chat_id, "text": message}
+        r = requests.post(url, data=payload, timeout=10)
+        app.logger.info("TELEGRAM PUSH %s", r.text)
+    except Exception as e:
+        app.logger.exception("Telegram push error: %s", e)
+
+# ---------------- Admin daily summary (08:00) ----------------
+def daily_admin_report():
+    try:
+        db = get_db()
+        today = date.today()
+        rows = db.execute("SELECT status, COUNT(*) as cnt FROM bookings WHERE date(created_at)=? GROUP BY status", (today.isoformat(),)).fetchall()
+        summary = {r["status"]: r["cnt"] for r in rows}
+        total = sum(summary.values())
+        msg = f"Daily Bookings Report ({today.isoformat()})\nTotal: {total}\n"
+        for k, v in summary.items():
+            msg += f"{k}: {v}\n"
+        # send to telegram and email admin
+        telegram_push(msg)
+        # email admin (use send_email_via_brevo)
+        send_email_via_brevo("Admin", "-", "-", today.isoformat(), "-", "-", msg, customer_email=None, status="Daily Report")
+    except Exception as e:
+        app.logger.exception("daily_admin_report error: %s", e)
+
+# start scheduler
+scheduler = BackgroundScheduler()
+scheduler.add_job(daily_admin_report, 'cron', hour=8, minute=0)  # 08:00 server time
+scheduler.start()
+
+# ---------------- Utility ----------------
+def render_with_values(message, category="danger", **kwargs):
+    flash(message, category)
+    return render_template("book.html", **kwargs)
+
+# ---------------- ROUTES ----------------
+@app.route("/")
+def index():
+    return render_template("index.html")
+
+@app.route("/book", methods=["GET", "POST"])
+def book():
+    if request.method == "POST":
+        name = request.form.get("name", "").strip()
+        location = request.form.get("location", "").strip()
+        phone = request.form.get("phone", "").strip()
+        event_date = request.form.get("event_date", "").strip()
+        service = request.form.get("service", "").strip()
+        notes = request.form.get("notes", "").strip()
+        customer_email = request.form.get("customer_email", "").strip() or None
+
+        extras_list = request.form.getlist("extras")
+        extras = ", ".join(extras_list)
+
+        whatsapp_link = f"https://wa.me/91{phone}?text=Hello%20JAGADHA,%20I%20want%20to%20discuss%20my%20booking."
+
+        # Validations
+        if not name:
+            return render_with_values("⚠ Please fill Name!", name=name)
+        if not location:
+            return render_with_values("⚠ Please fill Location!", name=name, location=location)
+        if not phone:
+            return render_with_values("⚠ Please fill Phone!", name=name)
+        if not event_date:
+            return render_with_values("⚠ Please fill Date!", name=name)
+        if not service:
+            return render_with_values("⚠ Please select Service!", name=name)
+        if len(extras_list) == 0:
+            return render_with_values("⚠ Select Additional Services!", name=name)
+
+        db = get_db()
+        cur = db.execute(
+            """
+            INSERT INTO bookings (name, location, phone, event_date, service, extras, notes, customer_email)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (name, location, phone, event_date, service, extras, notes, customer_email),
+        )
+        db.commit()
+        booking_id = cur.lastrowid
+
+        # Background notifications
+        def notify():
+            """
+            Background async notifier:
+            - Sends Brevo email (Admin + Customer)
+            - Sends WhatsApp confirmation
+            - Sends Telegram alert to admin
+            """
+            with app.app_context():
+                try:
+                    # 1) Always send ADMIN + CUSTOMER email (Pending)
+                    send_email_via_brevo(
+                        name, location, phone, event_date,
+                        service, extras, notes, customer_email,
+                        status="Pending",
+                        booking_id=booking_id
+                    )
+                except Exception:
+                    app.logger.exception("Error sending pending email")
+
+                # 2) WhatsApp message (best-effort)
+                try:
+                    send_whatsapp_message(name, phone, event_date, service, extras, location, customer_email, notes)
+                except Exception:
+                    app.logger.exception("WhatsApp send failed")
+
+                # 3) Admin Telegram alert
+                try:
+                    telegram_push(
+                        f"📩 New Booking #{booking_id}\n"
+                        f"👤 {name}\n"
+                        f"🎈 {service}\n"
+                        f"📅 {event_date}"
+                    )
+                except Exception:
+                    app.logger.exception("Telegram push failed")
+
+        threading.Thread(target=notify, daemon=True).start()
+
+        return redirect(url_for("booking_success", booking_id=booking_id))
+
+    return render_template("book.html")
+
+@app.route("/booking/<int:booking_id>")
+def booking_success(booking_id):
+    db = get_db()
+    row = db.execute("SELECT * FROM bookings WHERE id=?", (booking_id,)).fetchone()
+    if not row:
+        flash("Booking not found", "danger")
+        return redirect(url_for("index"))
+    return render_template("booking_success.html", booking=row)
+
+@app.route("/receipt/<int:booking_id>")
+def download_receipt(booking_id):
+    db = get_db()
+    row = db.execute("SELECT * FROM bookings WHERE id=?", (booking_id,)).fetchone()
+    if not row:
+        flash("Booking not found", "danger")
+        return redirect(url_for("index"))
+    pdf_bytes = generate_pdf_receipt(row)
+    return Response(pdf_bytes, mimetype='application/pdf', headers={"Content-Disposition":f"attachment;filename=booking_{booking_id}.pdf"})
+
+# ---------------- ADMIN & DASHBOARD ----------------
+@app.route("/admin")
+def admin():
+    if not session.get("admin"):
+        return redirect(url_for("login"))
+    rows = get_db().execute("SELECT * FROM bookings ORDER BY created_at DESC").fetchall()
+    return render_template("admin.html", bookings=rows)
+
+@app.route("/admin/dashboard")
+def admin_dashboard():
+    if not session.get("admin"):
+        return redirect(url_for("login"))
+    return render_template("admin_dashboard.html")
+
+# JSON endpoint used by dashboard
+@app.route("/api/bookings")
+def api_bookings():
+    if not session.get("admin"):
+        return jsonify({"bookings":[]})
+
+    rows = get_db().execute("SELECT * FROM bookings ORDER BY created_at DESC").fetchall()
+
+    bookings = []
+    for r in rows:
+        # safe access to status (backwards compatible)
+        status = r["status"] if "status" in r.keys() else "Pending"
+        bookings.append({
+            "id": r["id"],
+            "name": r["name"],
+            "phone": r["phone"],
+            "location": r["location"],
+            "event_date": r["event_date"],
+            "service": r["service"],
+            "extras": r["extras"],
+            "notes": r["notes"],
+            "customer_email": r["customer_email"],
+            "status": status,
+            "created_at": r["created_at"],
+        })
+
+    return jsonify({"bookings": bookings})
+
+# CSV export
+@app.route("/export_csv")
+def export_csv():
+    if not session.get("admin"):
+        return redirect(url_for("login"))
+    rows = get_db().execute("SELECT * FROM bookings ORDER BY created_at DESC").fetchall()
+    si = io.StringIO()
+    cw = csv.writer(si)
+    cw.writerow(["id","name","phone","email","location","event_date","service","extras","notes","status","created_at"])
+    for r in rows:
+        cw.writerow([r["id"], r["name"], r["phone"], r["customer_email"], r["location"], r["event_date"], r["service"], r["extras"], r["notes"], r["status"], r["created_at"]])
+    output = si.getvalue()
+    return Response(output, mimetype="text/csv", headers={"Content-Disposition":"attachment;filename=bookings.csv"})
+
 @app.route("/login", methods=["GET", "POST"])
 def login():
     if request.method == "POST":
-        username = request.form.get("username")
-        password = request.form.get("password")
-
-        if username == USERNAME and password == PASSWORD:
-            session["logged_in"] = True
-            return redirect(url_for("form_page"))
-        else:
-            flash("Invalid username or password!", "danger")
-            return redirect(url_for("login"))
-
+        if request.form.get("username") == ADMIN_USER and request.form.get("password") == ADMIN_PASS:
+            session["admin"] = True
+            return redirect(url_for("admin_dashboard"))
+        flash("❌ Invalid Credentials", "danger")
     return render_template("login.html")
-
 
 @app.route("/logout")
 def logout():
-    session.pop("logged_in", None)
+    session.clear()
     return redirect(url_for("login"))
 
-
-# -------------------------------------------------------------
-# PROTECT ROUTES
-# -------------------------------------------------------------
-@app.before_request
-def require_login():
-    allowed = ["static", "login", "logout", "ping"]
-
-    if request.endpoint in allowed:
-        return
-
-    protected = ["form_page", "generate_pdf", "download_last"]
-
-    if request.endpoint in protected and not session.get("logged_in"):
+# ---------------- DELETE / CONFIRM / REJECT ----------------
+@app.route("/delete/<int:booking_id>")
+def delete_booking(booking_id):
+    if not session.get("admin"):
         return redirect(url_for("login"))
+    db = get_db()
+    db.execute("DELETE FROM bookings WHERE id=?", (booking_id,))
+    db.commit()
+    flash("🗑️ Booking deleted successfully!", "success")
+    return redirect(url_for("admin_dashboard"))
 
-
-# -------------------------------------------------------------
-# COLORS
-# -------------------------------------------------------------
-PAGE_WIDTH, PAGE_HEIGHT = A4
-PINK = colors.HexColor("#E91E63")
-PINK_DARK = colors.HexColor("#d81b60")
-LIGHT_PINK = colors.HexColor("#F8D7E8")
-SOFT_PINK = colors.HexColor("#FFF1F6")
-GREY_BG = colors.HexColor("#F2F2F2")
-DARK_TEXT = colors.HexColor("#333333")
-
-# -------------------------------------------------------------
-# UTIL
-# -------------------------------------------------------------
-def safe_float(val):
+@app.route("/confirm/<int:booking_id>")
+def confirm_booking(booking_id):
+    if not session.get("admin"):
+        return redirect(url_for("login"))
+    db = get_db()
+    row = db.execute("SELECT * FROM bookings WHERE id=?", (booking_id,)).fetchone()
+    if not row:
+        flash("Booking not found!", "danger")
+        return redirect(url_for("admin_dashboard"))
+    # Attempt update; if status column missing, tell user to run /fixdb
     try:
-        return float(str(val).replace(",", "").strip())
-    except:
-        return 0.0
+        db.execute("UPDATE bookings SET status='Confirmed' WHERE id=?", (booking_id,))
+        db.commit()
+    except sqlite3.OperationalError as e:
+        app.logger.exception("DB update failed: %s", e)
+        flash("Database missing 'status' column. Visit /fixdb to add it.", "danger")
+        return redirect(url_for("admin_dashboard"))
 
-
-# -------------------------------------------------------------
-# BORDER STYLING
-# -------------------------------------------------------------
-def draw_border(canvas, doc):
-    canvas.saveState()
-
-    canvas.setLineWidth(3)
-    canvas.setStrokeColor(PINK_DARK)
-    canvas.rect(12 * mm, 12 * mm,
-                PAGE_WIDTH - 24 * mm, PAGE_HEIGHT - 24 * mm)
-
-    canvas.setLineWidth(1)
-    canvas.setStrokeColor(LIGHT_PINK)
-    canvas.rect(16 * mm, 16 * mm,
-                PAGE_WIDTH - 32 * mm, PAGE_HEIGHT - 32 * mm)
-
-    canvas.restoreState()
-
-
-# -------------------------------------------------------------
-# HEADER BAR
-# -------------------------------------------------------------
-class HeaderBar(Flowable):
-    def __init__(self, width, height=20):
-        Flowable.__init__(self)
-        self.width = width
-        self.height = height
-
-    def draw(self):
-        self.canv.saveState()
-        self.canv.setFillColor(PINK)
-        self.canv.rect(0, 0, self.width, self.height, fill=1, stroke=0)
-        self.canv.restoreState()
-
-
-# -------------------------------------------------------------
-# SECTION TABLE BUILDER
-# -------------------------------------------------------------
-def build_section_table(title, rows, styles, total_manual=None):
-    story = []
-    story.append(Paragraph(f"<b>{title}</b>", styles["SectionHeading"]))
-    story.append(Spacer(1, 6))
-
-    if not rows:
-        rows = [["(no items)", ""]]
-
-    table_data = [
-        [
-            Paragraph("<b>Item Name</b>", styles["TableHeader"]),
-            Paragraph("<b>Price</b>", styles["Right"])
-        ]
-    ]
-
-    for it, qt in rows:
-        table_data.append([
-            it,
-            Paragraph(qt, styles["Right"])
-        ])
-
-    if total_manual is not None:
-        table_data.append([
-            Paragraph("<b>TOTAL</b>", styles["Normal"]),
-            Paragraph(f"<b>{total_manual:.2f}</b>", styles["Right"])
-        ])
-
-    tbl = Table(table_data, colWidths=[330, 110])
-
-    style = TableStyle([
-        ("GRID", (0, 0), (-1, -1), 0.5, LIGHT_PINK),
-        ("BACKGROUND", (0, 0), (-1, 0), SOFT_PINK),
-        ("ALIGN", (1, 1), (1, -1), "RIGHT"),
-    ])
-
-    if total_manual is not None:
-        last = len(table_data) - 1
-        style.add("BACKGROUND", (0, last), (-1, last), GREY_BG)
-
-    tbl.setStyle(style)
-    story.append(tbl)
-    story.append(Spacer(1, 12))
-
-    return story
-
-
-# -------------------------------------------------------------
-# PDF CREATOR
-# -------------------------------------------------------------
-def create_quotation_pdf(customer, event_date, mandabam,
-                         stage_rows, stage_total_manual,
-                         stall_rows, stall_total_manual,
-                         stall_all_total, stall_advance,
-                         stall_final_balance,
-                         other_rows, other_total_manual):
-
-    buffer = io.BytesIO()
-    styles = getSampleStyleSheet()
-
-    styles.add(ParagraphStyle(name="TitleCentered", parent=styles["Title"], alignment=1))
-    styles.add(ParagraphStyle(name="SectionHeading", parent=styles["Heading3"],
-                              alignment=0, fontSize=12, textColor=DARK_TEXT))
-    styles.add(ParagraphStyle(name="TableHeader", parent=styles["Normal"], alignment=0, fontSize=10))
-    styles.add(ParagraphStyle(name="Right", parent=styles["Normal"], alignment=2, fontSize=10))
-
-    doc = SimpleDocTemplate(buffer, pagesize=A4,
-                            leftMargin=20 * mm, rightMargin=20 * mm,
-                            topMargin=15 * mm, bottomMargin=15 * mm)
-
-    story = []
-
-    logo_path = "static/images/logo.jpg"
+    # notifications
     try:
-        logo = Image(logo_path, width=90 * mm, height=50 * mm)
-        logo.hAlign = "CENTER"
-        story.append(logo)
-        story.append(Spacer(1, 8))
-    except:
-        pass
+        msg = f"🎉 Your booking for {row['event_date']} is CONFIRMED!"
+        send_sms_fast2sms(row["phone"], msg)
+        send_whatsapp_message(row["name"], row["phone"], row["event_date"], row["service"], row["extras"], row["location"], row["customer_email"], row["notes"])
+        # send email to admin + customer with attachment
+        send_email_via_brevo(row["name"], row["location"], row["phone"], row["event_date"], row["service"], row["extras"], row["notes"], row["customer_email"], status="Confirmed", booking_id=booking_id)
+    except Exception as e:
+        app.logger.exception("Error sending confirmation notifications: %s", e)
+    flash("Booking Confirmed ✓", "success")
+    return redirect(url_for("admin_dashboard"))
 
-    story.append(Spacer(1, 10))
-    story.append(Paragraph("<para align='center'><b><u>QUOTATION</u></b></para>", styles["Heading2"]))
-    story.append(Spacer(1, 14))
+@app.route("/reject/<int:booking_id>")
+def reject_booking(booking_id):
+    if not session.get("admin"):
+        return redirect(url_for("login"))
+    db = get_db()
+    row = db.execute("SELECT * FROM bookings WHERE id=?", (booking_id,)).fetchone()
+    if not row:
+        flash("Booking not found!", "danger")
+        return redirect(url_for("admin_dashboard"))
+    try:
+        db.execute("UPDATE bookings SET status='Rejected' WHERE id=?", (booking_id,))
+        db.commit()
+    except sqlite3.OperationalError as e:
+        app.logger.exception("DB update failed: %s", e)
+        flash("Database missing 'status' column. Visit /fixdb to add it.", "danger")
+        return redirect(url_for("admin_dashboard"))
 
-    cust = Table([
-        [
-            Paragraph(f"<b>Customer Name:</b> {customer}", styles["Normal"]),
-            Paragraph(f"<b>Event Date:</b> {event_date}", styles["Normal"])
-        ],
-        [
-            Paragraph(f"<b>Mandabam Name:</b> {mandabam}", styles["Normal"]),
-            ""
-        ]
-    ], colWidths=[270, 170])
+    try:
+        msg = f"❌ Sorry, your booking on {row['event_date']} was rejected."
+        send_sms_fast2sms(row["phone"], msg)
+        send_email_via_brevo(row["name"], row["location"], row["phone"], row["event_date"], row["service"], row["extras"], f"Your booking was rejected.", row["customer_email"], status="Rejected", booking_id=booking_id)
+    except Exception as e:
+        app.logger.exception("Error sending rejection notifications: %s", e)
+    flash("Booking Rejected ❌", "warning")
+    return redirect(url_for("admin_dashboard"))
 
-    cust.setStyle(TableStyle([
-        ("BACKGROUND", (0, 0), (-1, -1), SOFT_PINK),
-        ("BOX", (0, 0), (-1, -1), 0.8, LIGHT_PINK),
-        ("INNERGRID", (0, 0), (-1, -1), 0.4, LIGHT_PINK)
-    ]))
-
-    story.append(cust)
-    story.append(Spacer(1, 14))
-
-    story.extend(build_section_table("STAGE DECORATION", stage_rows, styles, stage_total_manual))
-    story.extend(build_section_table("STALL ITEMS", stall_rows, styles, stall_total_manual))
-    story.extend(build_section_table("OTHER ITEMS", other_rows, styles, other_total_manual))
-
-    story.append(Paragraph("<b>AMOUNT SUMMARY</b>", styles["SectionHeading"]))
-    story.append(Spacer(1, 6))
-
-    summary = Table([
-        ["ALL TOTAL", Paragraph(f"<b>{stall_all_total:.2f}</b>", styles["Right"])],
-        ["ADVANCE", Paragraph(f"<b>{stall_advance:.2f}</b>", styles["Right"])],
-        ["BALANCE", Paragraph(f"<b>{stall_final_balance:.2f}</b>", styles["Right"])],
-    ], colWidths=[320, 110])
-
-    summary.setStyle(TableStyle([
-        ("BACKGROUND", (0, 0), (-1, -1), GREY_BG),
-        ("BOX", (0, 0), (-1, -1), 1, LIGHT_PINK),
-        ("ALIGN", (1, 0), (1, -1), "RIGHT"),
-        ("FONTNAME", (0, 0), (-1, -1), "Helvetica-Bold")
-    ]))
-
-    story.append(summary)
-    story.append(Spacer(1, 20))
-
-    story.append(Paragraph("<para align='center'><b>*** THANK YOU ***</b></para>", styles["Heading2"]))
-
-    doc.build(story, onFirstPage=draw_border, onLaterPages=draw_border)
-
-    buffer.seek(0)
-    return buffer
-
-
-# -------------------------------------------------------------
-# FORM PAGE
-# -------------------------------------------------------------
-@app.route("/")
-def form_page():
-    success = session.pop("pdf_success", None)
-    return render_template("form.html", success=success)
-
-
-# -------------------------------------------------------------
-# GENERATE PDF  (FIXED)
-# -------------------------------------------------------------
-@app.route("/generate_pdf", methods=["POST"])
-def generate_pdf():
-    customer = request.form.get("customer", "")
-    event_date = request.form.get("event_date", "")
-    mandabam = request.form.get("mandabam", "")
-
-    stage_rows = list(zip(request.form.getlist("stage_item[]"),
-                          request.form.getlist("stage_price[]")))
-    stage_total_manual = safe_float(request.form.get("stage_total"))
-
-    stall_rows = list(zip(request.form.getlist("stall_item[]"),
-                          request.form.getlist("stall_price[]")))
-    stall_total_manual = safe_float(request.form.get("stall_total"))
-
-    other_rows = list(zip(request.form.getlist("other_item[]"),
-                          request.form.getlist("other_price[]")))
-    other_total_manual = safe_float(request.form.get("other_total"))
-
-    stall_advance = safe_float(request.form.get("stall_advance"))
-    stall_final_balance = safe_float(request.form.get("stall_final_balance"))
-
-    stall_all_total = stage_total_manual + stall_total_manual + other_total_manual
-
-    pdf_buffer = create_quotation_pdf(
-        customer, event_date, mandabam,
-        stage_rows, stage_total_manual,
-        stall_rows, stall_total_manual,
-        stall_all_total, stall_advance,
-        stall_final_balance,
-        other_rows, other_total_manual
-    )
-
-    # ----- FIXED: SAVE PDF TO TEMP FILE (NOT SESSION) -----
-    filename = f"{int(time.time())}.pdf"
-    file_path = os.path.join(TEMP_DIR, filename)
-
-    with open(file_path, "wb") as f:
-        f.write(pdf_buffer.getvalue())
-
-    session["last_pdf_path"] = file_path
-    session["pdf_success"] = True
-
-    download_name = f"{customer.replace(' ', '_')}_Event_Quotation_{event_date.replace(' ', '_')}.pdf"
-    return send_file(pdf_buffer, as_attachment=True, download_name=download_name)
-
-
-# -------------------------------------------------------------
-# DOWNLOAD LAST PDF (FIXED)
-# -------------------------------------------------------------
-@app.route("/download_last")
-def download_last():
-    file_path = session.get("last_pdf_path")
-
-    if not file_path or not os.path.exists(file_path):
-        return "No PDF available."
-
-    return send_file(file_path,
-                     as_attachment=True,
-                     download_name="Last_Generated_Quotation.pdf",
-                     mimetype="application/pdf")
+# ---------------- AUTO FIX DB ON STARTUP ----------------
+def auto_fix_db():
+    db = get_db()
+    try:
+        db.execute("ALTER TABLE bookings ADD COLUMN status TEXT DEFAULT 'Pending'")
+        db.commit()
+        print("AUTO-FIX ✔: 'status' column added")
+    except Exception as e:
+        print("AUTO-FIX ℹ: status column already exists / skipped:", e)
 
 
 @app.route("/ping")
 def ping():
     return "pong"
 
-
-# -------------------------------------------------------------
-# RUN
-# -------------------------------------------------------------
+# ---------------- MAIN ----------------
 if __name__ == "__main__":
-    app.run(debug=True, host="172.16.2.26", port=5000)
+    # Ensure DB fix runs before app starts
+    with app.app_context():
+        auto_fix_db()
+
+    try:
+        app.run(
+            debug=True,
+            host="0.0.0.0",                 # Use 0.0.0.0 for Render compatibility
+            port=int(os.getenv("PORT", 5000))
+        )
+    finally:
+        try:
+            scheduler.shutdown()
+        except Exception:
+            pass
